@@ -1,8 +1,11 @@
 """Types abstraits partagés. Aucune dépendance hardware ici."""
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
 
-import numpy as np
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 @dataclass

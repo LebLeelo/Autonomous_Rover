@@ -8,18 +8,18 @@
 
 ## 🎯 Mission
 
-A *planetary rover*–style inspection scenario, in a controlled, **deterministic** environment (fully reproducible runs):
+A *planetary rover*–style inspection scenario for a controlled course:
 
 1. Self-test at startup
 2. Autonomous navigation to a zone of interest (obstacle avoidance)
 3. Target detection and identification with the onboard camera
 4. Approach / alignment, then arm action (touch, grasp, press)
 5. Action verification, then `RETURN HOME`
-6. Continuous anomaly monitoring → recovery, or `SAFE MODE` if the mission can no longer continue
+6. Periodic health checks and fault response: recover, request return, or enter `SAFE MODE`
 
 ## 🔀 State Machine
 
-The backbone of the application: an **explicit** state machine, with a `FAULT → RECOVERY` transition reachable from any state.
+The mission manager enforces explicit, validated state transitions. A fault enters `FAULT → RECOVERY`, then resumes the interrupted state, requests return, or enters `SAFE_MODE`.
 
 ```mermaid
 stateDiagram-v2
@@ -41,11 +41,17 @@ stateDiagram-v2
   MANIPULATE --> FAULT : anomaly
   RETURN_HOME --> FAULT : anomaly
   FAULT --> RECOVERY
-  RECOVERY --> MISSION : resumed
+  RECOVERY --> BOOT : resumed during startup
+  RECOVERY --> NAVIGATE : resumed during navigation
+  RECOVERY --> SEARCH_TARGET : resumed while searching
+  RECOVERY --> APPROACH : resumed while approaching
+  RECOVERY --> MANIPULATE : resumed during manipulation
+  RECOVERY --> VERIFY_ACTION : resumed during verification
+  RECOVERY --> RETURN_HOME : return requested
   RECOVERY --> SAFE_MODE : failed
 ```
 
-On top of it, a **health hierarchy** managed by the Health Monitor:
+The FDIR health manager tracks:
 
 `NOMINAL → DEGRADED → CRITICAL → SAFE`
 
@@ -56,10 +62,8 @@ src/
 ├── mission/        # which activity to perform (Mission Manager)
 ├── navigation/     # where to go, how to avoid, when to stop
 ├── perception/     # image → target/obstacle → relative position
-├── control/        # decision → motor commands (v, ω)
-├── manipulation/   # arm action on the target
+├── manipulation/   # timed arm/gripper sequence and visual verification
 ├── fdir/           # fault detection, isolation & recovery
-├── safety/         # mechanisms that override the mission (safe mode, watchdog)
 ├── hardware/       # camera, motors, arm, sensors, battery
 └── common/         # event logging, state transitions, utilities
 ```
@@ -68,27 +72,65 @@ Key separation: **decision (mission) / behavior (navigation, perception) / contr
 
 ## 🔌 Hardware Abstraction
 
-Mission logic never touches GPIO or the camera directly. It relies on a single interface:
+Navigation and mission logic use an injected robot interface for motion, camera, and optional battery telemetry:
 
 ```python
 robot.move(v, omega)
 robot.stop()
 robot.get_camera_frame()
 robot.get_battery()
-robot.arm.move()
 ```
 
-Two interchangeable implementations: `RealRobot` (Raspberry Pi) and `SimulatedRobot` — the same mission code runs on the real robot **or** in simulation, so you can test without risking the hardware.
+`RealRobot` adapts the Adeept `Move` driver and the local Picamera2 wrapper. The ultrasonic adapter uses Adeept's `Ultra.checkdist()` (centimeters) and exposes meters to navigation. The arm adapter uses servo channels 2 and 4 via `RPIservo.ServoCtrl`; verify these channel assignments and servo directions on the assembled robot before running the mission. Hardware dependencies are injected in the tests.
 
 > No ROS required: a modular Python architecture, designed to stay simple and verifiable.
 
+## 🧭 Mission Behavior
+
+Run on the Raspberry Pi from the repository root:
+
+```bash
+python -m src.mission.mission_manager
+```
+
+The mission performs a camera/range/servo-state self-test; searches for the configured color target; aligns and approaches using its estimated range; runs a timed open/lower/grip/lift sequence; checks that the target is no longer visible; then replays recorded motion segments in reverse as a best-effort return.
+
 ## 🛡️ FDIR
 
-- Continuous monitoring: battery, odometry, sensors, perception timeouts
-- Health hierarchy: graceful degradation before safe mode
-- Fault injection in tests (low battery, sensor loss, stalled motor)
-- Full logging of events and state transitions
+- Periodic CPU, memory, and temperature checks using Adeept's `Info` module; battery monitoring runs only when a battery reader is configured.
+- Camera and ultrasonic failures are retried once and verified. A failed recovery or critical fault stops the drive and servo motion and latches `SAFE_MODE`.
+- Low battery requests return; a critical battery reading requests SAFE.
+- Fault injection is available from the mission entry point:
 
-## ✅ Positioning
+```bash
+python -m src.mission.mission_manager --fault camera
+python -m src.mission.mission_manager --fault motor
+python -m src.mission.mission_manager --fault battery
+python -m src.mission.mission_manager --fault communication
+```
+
+Motor and communication faults are injected scenarios because the current hardware interface has no motor feedback or communication-health signal. Battery fault injection is also independent of a physical battery reading.
+
+## ✅ Verification
+
+Run the hardware-independent unit and mission tests:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+The tests cover state transitions, the nominal mission path, return replay, arm driver commands, recovery, fault injection, and safe-state behavior using fake devices. They do not verify physical movement, grasp success, camera calibration, or return-home accuracy.
+
+V&amp;V  artifacts: [requirements](docs/requirements.md), [verification matrix](docs/verification_matrix.md), [test report](docs/test_report.md), [metrics](docs/metrics.md), [architecture](docs/architecture.md), [FDIR](docs/fdir.md), and [limitations](docs/limitations.md). Matrix statuses distinguish software evidence from hardware checks not yet run.
+
+## ⚠️ Limitations
+
+- Return-home is reverse replay of timed commands, not localization. Wheel slip, collisions, or changed obstacles can prevent reaching the start.
+- Manipulation is open-loop servo timing. Verification only checks target visibility; it does not prove the object was grasped or moved.
+- The arm adapter assumes Adeept servo channels 2 (arm) and 4 (gripper), with stock directions and a 0.4-second movement pulse. Calibrate before hardware execution.
+- There is no wheel odometry, measured motor response, physical battery percentage, or communication monitor. A servo self-test reads the driver's tracked position, not physical feedback.
+- The navigation policy is local and reactive, using one forward-facing ultrasonic sensor. It does not plan around arbitrary obstacles.
+
+## ✅ Engineering Approach
 
 This is **not** ECSS-compliant space software — it is a project that **applies practices inspired by ECSS-E-ST-40** (requirements, design, V&amp;V, traceability) to a small autonomous robotic platform. The goal: demonstrate the *systems engineering* reasoning behind a real autonomous system.
